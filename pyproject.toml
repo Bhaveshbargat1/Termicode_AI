@@ -41,7 +41,7 @@ addopts = "-v --strict-markers"
 line-length = 100
 target-version = "py311"
 src = ["src", "tests"]
-exclude = ["generate_guide_pdf.py", ".venv"]
+exclude = ["generate_guide_pdf.py", "generate_portfolio_pdf.py", ".venv"]
 
 [tool.ruff.lint]
 select = [
