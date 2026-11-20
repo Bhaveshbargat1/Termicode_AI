@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import difflib
+import json
 
 from termicode.agent.models import PolicyDecision, ProposedAction
 from termicode.agent.workflows import WorkflowProfile
@@ -65,6 +66,17 @@ class PolicyEngine:
             preview = f"Execute command in {boundary.root}:\n  {cmd_str}"
             return preview, None, cmd_args, None
 
+        if self._registry.has(action.tool_name):
+            tool_obj = self._registry.get(action.tool_name)
+            if getattr(tool_obj, "is_mcp", False):
+                args_str = json.dumps(action.arguments, indent=2)
+                s_name = getattr(tool_obj, "server_name", "default")
+                preview = (
+                    f"Execute remote MCP tool '{action.tool_name}' "
+                    f"via ToolBridge server '{s_name}' with arguments:\n{args_str}"
+                )
+                return preview, None, None, None
+
         return None, None, None, None
 
     def _generate_preview(self, action: ProposedAction, boundary: WorkspaceBoundary) -> str | None:
@@ -119,13 +131,15 @@ class PolicyEngine:
 
         # 3. Check workflow explicit tool allowlist if specified
         if workflow.allowed_tools is not None and tool.name not in workflow.allowed_tools:
-            return PolicyDecision(
-                status="deny",
-                reason=(
-                    f"Tool '{tool.name}' is not in the allowlist for workflow '{workflow.name}'."
-                ),
-                risk_level=tool.risk_level,
-            )
+            if not getattr(tool, "is_mcp", False) and not getattr(tool, "is_rag", False):
+                return PolicyDecision(
+                    status="deny",
+                    reason=(
+                        f"Tool '{tool.name}' is not in the allowlist for "
+                        f"workflow '{workflow.name}'."
+                    ),
+                    risk_level=tool.risk_level,
+                )
 
         # 4. Check schema validation for arguments
         try:
@@ -137,17 +151,25 @@ class PolicyEngine:
                 risk_level=tool.risk_level,
             )
 
-        # 5. Check approval requirement (writes and command executions require approval)
-        if tool.risk_level in (RiskLevel.WRITE, RiskLevel.EXECUTE):
+        # 5. Check approval requirement (writes, commands, and all MCP tools require approval)
+        requires_approval = getattr(tool, "is_mcp", False) or tool.risk_level in (
+            RiskLevel.WRITE,
+            RiskLevel.EXECUTE,
+        )
+        if requires_approval:
             preview, target_path, command_args, diff = self._extract_approval_details(
                 action, boundary
             )
-            return PolicyDecision(
-                status="needs_approval",
-                reason=(
+            if getattr(tool, "is_mcp", False):
+                reason_msg = f"Remote MCP tool '{tool.name}' requires explicit user confirmation."
+            else:
+                reason_msg = (
                     f"Tool '{tool.name}' ({tool.risk_level.value}) "
                     "requires explicit user confirmation."
-                ),
+                )
+            return PolicyDecision(
+                status="needs_approval",
+                reason=reason_msg,
                 risk_level=tool.risk_level,
                 preview=preview,
                 target_path=target_path,

@@ -102,6 +102,36 @@ class AgentRequest(BaseModel):
         default=None,
         description="Optional override for target model.",
     )
+    debug: bool = Field(
+        default=False,
+        description="Whether to output step-by-step debug traces.",
+    )
+    repetition_guard: bool = Field(
+        default=False,
+        description="Whether loop guard terminates if identical tool action repeats.",
+    )
+    repetition_threshold: int = Field(
+        default=3,
+        ge=2,
+        le=10,
+        description="Consecutive identical tool proposals before repetition guard trips.",
+    )
+    auto_commit: bool = Field(
+        default=False,
+        description="Whether to commit changes upon successful completion.",
+    )
+    commit_message: str | None = Field(
+        default=None,
+        description="Commit message when auto_commit is enabled.",
+    )
+    auto_rollback: bool = Field(
+        default=True,
+        description="Whether to rollback to checkpoint on failure or cancellation.",
+    )
+    checkpoint_on_mutate: bool = Field(
+        default=True,
+        description="Whether to create Git checkpoints before file-modifying tool actions.",
+    )
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -240,6 +270,18 @@ class RunResult(BaseModel):
     run_summary: RunSummary | None = Field(
         default=None,
         description="Compact task summary stored in local memory.",
+    )
+    rolled_back: bool = Field(
+        default=False,
+        description="Whether changes were rolled back to a checkpoint.",
+    )
+    rollback_checkpoint_id: str | None = Field(
+        default=None,
+        description="ID of checkpoint restored during rollback, if any.",
+    )
+    committed_hash: str | None = Field(
+        default=None,
+        description="Commit hash if changes were committed to Git.",
     )
 
     @property

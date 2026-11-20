@@ -73,6 +73,28 @@ class Settings(BaseSettings):
         le=600.0,
         description="HTTP request timeout for LLM provider completions.",
     )
+    toolbridge_enabled: bool = Field(
+        default=False,
+        description="Enable ToolBridge MCP gateway integration.",
+    )
+    toolbridge_api_url: str = Field(
+        default="http://127.0.0.1:8000",
+        description="Base URL of the ToolBridge REST API gateway.",
+    )
+    toolbridge_api_key: str | None = Field(
+        default=None,
+        description="API Key for ToolBridge authentication.",
+    )
+    toolbridge_role: str = Field(
+        default="readonly",
+        description="Role identity for ToolBridge access ('readonly', 'operator', 'admin').",
+    )
+    toolbridge_timeout_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=300.0,
+        description="HTTP request timeout for ToolBridge API calls.",
+    )
 
     @classmethod
     def load(

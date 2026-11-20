@@ -27,6 +27,16 @@ from termicode.tools.filesystem import (
     WriteFileTool,
 )
 from termicode.tools.registry import ToolRegistry, create_default_registry
+from termicode.tools.toolbridge import (
+    ToolBridgeAuthError,
+    ToolBridgeClientStub,
+    ToolBridgeConfig,
+    ToolBridgeConnectionError,
+    ToolBridgeError,
+    ToolBridgeRateLimitError,
+    ToolBridgeStubArgs,
+    ToolBridgeStubTool,
+)
 
 __all__ = [
     "ApplyPatchArgs",
@@ -45,6 +55,14 @@ __all__ = [
     "SearchTextTool",
     "ToolArgumentError",
     "ToolAuditMetadata",
+    "ToolBridgeAuthError",
+    "ToolBridgeClientStub",
+    "ToolBridgeConfig",
+    "ToolBridgeConnectionError",
+    "ToolBridgeError",
+    "ToolBridgeRateLimitError",
+    "ToolBridgeStubArgs",
+    "ToolBridgeStubTool",
     "ToolContext",
     "ToolError",
     "ToolExecutionError",

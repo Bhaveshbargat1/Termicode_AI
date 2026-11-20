@@ -15,6 +15,7 @@ The Large Language Model (LLM) acts as an untrusted planner proposing actions. P
 - 🛡️ **[Threat Model](docs/threat-model.md)** — Trust boundaries, attack vectors, mitigated vs. unmitigated threats, and sandbox reality.
 - 🔒 **[Safety Guarantees](docs/safety.md)** — Workspace containment, approval engine, command allowlists, secret redaction, and MVP limitations.
 - 🔄 **[Workflow Profiles](docs/workflows.md)** — Single-agent profiles (`generate`, `debug`, `understand`, `tests`, `review`, `refactor`), tool permission matrix, and step budgets.
+- 🔌 **[ToolBridge MCP Gateway Integration](docs/INTEGRATION.md)** — Integration interface, REST API contracts, and extended tool configuration.
 
 ---
 
@@ -91,6 +92,59 @@ export OPENAI_API_KEY="sk-..."
 # Run with standard OpenAI models
 termicode run "explain project architecture"
 ```
+
+#### Option D: Interactive Terminal Chatbot (REPL)
+Launch an interactive, multi-turn conversational session with streaming markdown and syntax highlighting:
+```bash
+# Start conversational chatbot in the active workspace
+termicode chat
+
+# Or launch in 100% offline mode
+termicode chat --offline
+
+# Or specify a custom model or provider
+termicode chat -p ollama -m qwen2.5-coder:7b
+```
+
+Inside the chat session, you can use:
+- `/help` — Display command guide and controls.
+- `/upload <path>` — Attach PDFs, notes, or code files to the active session.
+- `/docs` — List all attached documents.
+- `/drop <id>` — Remove an attached document (with interactive confirmation).
+- `/steps [on|off]` — Toggle intermediate planner and safety steps panel.
+- `/session list` — List persistent conversation sessions stored in SQLite.
+- `/session switch <id>` — Switch to a previous session and restore message history.
+- `/session new [title]` — Create and activate a new persistent session.
+- `/session info` — View current session metadata, message count, and memory summary.
+- `/mcp servers` — Inspect configured ToolBridge MCP Gateway servers.
+- `/mcp list [server]` — Discover all available namespaced MCP tools.
+
+#### Option E: Browser Web Interface & Local Companion
+Launch the secure local companion service and open the browser-facing control center:
+```bash
+# Launch companion and automatically open web interface
+termicode web
+
+# Or run companion explicitly on custom port/token
+termicode companion --port 8765
+```
+
+**Security & Privacy Guarantees in Web/Companion Mode:**
+- **Zero Cloud Code Upload:** The companion runs strictly on `127.0.0.1`. Your code, documents, and credentials never leave your computer.
+- **CSRF & Origin Protection:** Rejects unauthorized cross-origin browser requests (HTTP 403).
+- **Token Authentication:** Requires an ephemeral cryptographically random companion token (`X-Companion-Token`) for all operations (HTTP 401).
+- **Human Approval Gate:** All file mutations (`write_file`, `apply_patch`), shell executions, and remote MCP actions require explicit approval with diff previews in the browser before any disk write occurs.
+- **Hosted Execution Gate:** Hosted arbitrary execution in the cloud is disabled by design. All real workspace modifications run safely through this local companion.
+- `/mcp inspect <tool>` — View tool input schema, sensitivity tier, and parameters.
+- `/mcp call <server> <tool> [args]` — Execute remote MCP tool with interactive confirmation.
+- `/checkpoint [msg]` — Save a manual Git workspace checkpoint.
+- `/rollback [id]` — Revert workspace to last checkpoint (with confirmation).
+- `/checkpoints` — List recent Git checkpoints.
+- `/new` — Clear history and start a fresh turn.
+- `/history` — View previous conversation turns.
+- `/settings` — Inspect or update active model/provider/ToolBridge configuration.
+- `/multiline` — Enter multi-line input mode (or start input with `"""`).
+- `exit` or `/exit` — Quit the chat session.
 
 ---
 
@@ -252,6 +306,133 @@ rm -rf sample_project
 # On Windows (PowerShell):
 Remove-Item -Recurse -Force sample_project
 ```
+
+---
+
+## 🔌 ToolBridge MCP Gateway Integration
+
+TermiCode AI integrates with the **[ToolBridge Enterprise MCP Gateway](../Toolbridge%20-%20mcp%20gateway/README.md)** to securely access external infrastructure tools (e.g., PostgreSQL database queries, GitHub repository issues, and external MCP servers) through an enterprise REST API or low-level MCP `stdio` stream.
+
+- **Contract & API Guide:** Detailed request/response payloads, authentication keys, and curl examples are documented in **[docs/INTEGRATION.md](docs/INTEGRATION.md)**.
+- **Client Scaffolding:** Stub contract and HTTP client are available in `termicode.tools.toolbridge` (`ToolBridgeClientStub`).
+- **Configuration (.env):**
+  ```ini
+  TERMICODE_TOOLBRIDGE_ENABLED=true
+  TERMICODE_TOOLBRIDGE_API_URL=http://127.0.0.1:8000
+  TERMICODE_TOOLBRIDGE_API_KEY="tb_dC9QQ7j_VY2aAxyqlIthznCS_6-OckoYtCrCIxECBlQ"
+  TERMICODE_TOOLBRIDGE_ROLE=operator
+  ```
+
+---
+
+## 🛡️ Version Control: Git Checkpoints & Rollback
+
+TermiCode AI provides automatic and manual Git checkpoints, allowing safe code experimentation and instant rollback when actions fail or are cancelled.
+
+### Key Capabilities
+
+1. **Workspace Git Verification & Initialization:**
+   TermiCode ensures the active workspace is a Git repository. Run `termicode init` to initialize Git version control and configure standard `.gitignore` rules (including automatic `.termicode/` exclusion).
+2. **Automated Mutating Checkpoints:**
+   Before any file-modifying tool (`write_file`, `apply_patch`) executes in the agent loop, TermiCode automatically creates a Git checkpoint capturing both modified and untracked files.
+3. **Automated & Interactive Rollback:**
+   If a planned step fails, exceeds its repair budget, or is cancelled by the user, TermiCode prompts to rollback the workspace to the pre-action checkpoint. In automated runs (`--yes` / `-y`), failing tools automatically revert workspace changes.
+4. **Uncommitted Changes Protection:**
+   TermiCode detects uncommitted modifications, logs warnings, and warns users before overwriting uncommitted files during rollbacks.
+5. **Post-Task Commits:**
+   Optionally commit workspace modifications after successful plan completion and test execution via `--commit` / `-c`.
+
+### CLI Commands
+
+```bash
+# 1. Initialize Git repository and TermiCode metadata
+termicode init
+
+# 2. Manually save a workspace checkpoint
+termicode checkpoint "before major refactor"
+
+# 3. List recent checkpoints
+termicode checkpoints
+
+# 4. Rollback to the most recent checkpoint (or specify an ID)
+termicode rollback
+termicode rollback cp_a1b2c3d4 -y
+
+# 5. Run a task with auto-commit on success
+termicode run "Implement helper functions in src/utils.py" --commit -m "Add helper utilities"
+```
+
+---
+
+## 🎯 Interactive "Try It Out" Walkthrough
+
+This rapid 5-minute walkthrough tests document question-answering (RAG), ToolBridge MCP tool discovery, and Git rollback protection:
+
+### 1. Initialize Workspace & Git Version Control
+```bash
+termicode init
+```
+*Output: Confirms workspace root validation, `.termicode/` metadata setup, and Git repository initialization.*
+
+### 2. Create Sample Document & Ask Questions via RAG
+Create a sample architecture note:
+```bash
+# In Bash / macOS / Linux:
+echo -e "# Architecture Notes\n\nAuthentication is handled via OAuth2 Bearer tokens with 15-minute expiry." > notes.md
+
+# In Windows PowerShell:
+Set-Content -Path notes.md -Value "# Architecture Notes`n`nAuthentication is handled via OAuth2 Bearer tokens with 15-minute expiry."
+```
+Now query TermiCode to extract answers from your notes:
+```bash
+termicode understand "What is the token expiry time mentioned in notes.md?" --offline
+```
+*Or attach it interactively in chat:*
+```bash
+termicode chat --offline
+termicode > /upload notes.md
+termicode > What authentication method and expiry time is specified in notes?
+```
+
+### 3. Connect to ToolBridge MCP Gateway
+If ToolBridge is running (`python -m toolbridge.api.app` on port 8000):
+```bash
+# Register ToolBridge Gateway
+termicode toolbridge add-server gateway http://127.0.0.1:8000 --token tb_admin_secret_key_123
+
+# List all 11 discovered tools across Filesystem, Postgres, and GitHub
+termicode toolbridge list-tools gateway
+
+# Inspect and execute a safe query
+termicode toolbridge call-tool gateway filesystem__read_file '{"path": "README.md"}'
+```
+
+### 4. Test Automated Safety Checkpoint & Rollback
+Save a manual checkpoint, experiment freely, and rollback:
+```bash
+# 1. Create a checkpoint
+termicode checkpoint "Clean state before test"
+
+# 2. Modify or corrupt a test file
+echo "experimental garbage" >> notes.md
+
+# 3. Rollback changes cleanly
+termicode rollback -y
+```
+*Output: Workspace is instantly restored to its clean checkpoint state!*
+
+---
+
+## ❓ Troubleshooting & FAQ
+
+| Error / Symptom | Probable Cause | Actionable Fix |
+| :--- | :--- | :--- |
+| **`Provider Authentication Error`** | No API key found in `.env` or environment. | Set `OPENAI_API_KEY="sk-..."` in `.env` or run with `--offline` (`-p fake`) for zero-dependency execution. |
+| **`Workspace Validation Error`** | File or command path targets a directory outside the approved workspace root. | TermiCode is strictly confined to your workspace root. Ensure paths are relative to the root or specify `--workspace <path>`. |
+| **`ToolBridge Gateway Unreachable`** | ToolBridge API service is not running on `http://127.0.0.1:8000`. | Start ToolBridge: `python -m toolbridge.api.app` or verify URL using `termicode toolbridge list-servers`. |
+| **`Not a Git repository`** | Workspace has not been initialized with Git. | Run `termicode init` or `git init` to initialize Git version control and enable checkpoints. |
+| **`Session Not Found`** | Provided session ID does not exist in `.termicode/chat_sessions.db`. | Run `termicode session list` to view active sessions, or `termicode session new "My Session"` to create one. |
+| **Where are full technical debug logs?** | TermiCode hides raw stack traces from the console to keep output clean and readable. | Full timestamped tracebacks are logged automatically to `.termicode/logs/debug.log` inside your workspace root. |
 
 ---
 

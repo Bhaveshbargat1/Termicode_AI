@@ -47,6 +47,18 @@ class ToolRegistry:
 
         self._tools[name] = tool
 
+    def register_or_replace(self, tool: BaseTool[Any]) -> None:
+        """Register a tool, replacing any existing tool with the same name."""
+        if not isinstance(tool, BaseTool):
+            raise TypeError(f"Expected BaseTool instance, got {type(tool).__name__}")
+        if not tool.name or not tool.name.strip():
+            raise ValueError("Tool name must be a non-empty string.")
+        self._tools[tool.name.strip()] = tool
+
+    def list_mcp_tools(self) -> list[BaseTool[Any]]:
+        """Return all registered tools that are remote MCP tools."""
+        return [tool for tool in self._tools.values() if getattr(tool, "is_mcp", False)]
+
     def get(self, name: str) -> BaseTool[Any]:
         """Retrieve a registered tool by name.
 
@@ -129,8 +141,11 @@ class ToolRegistry:
         return await tool.arun(arguments, context=context, raise_on_error=raise_on_error)
 
 
-def create_default_registry() -> ToolRegistry:
-    """Create and return a ToolRegistry pre-populated with all standard built-in tools."""
+def create_default_registry(workspace: Any | None = None) -> ToolRegistry:
+    """Create and return a ToolRegistry pre-populated with all standard built-in tools.
+
+    If workspace is provided, discovers and registers remote MCP tools from ToolBridge.
+    """
     from termicode.tools.command import RunCommandTool
     from termicode.tools.filesystem import (
         ApplyPatchTool,
@@ -139,6 +154,7 @@ def create_default_registry() -> ToolRegistry:
         SearchTextTool,
         WriteFileTool,
     )
+    from termicode.tools.rag import RAGRetrieveTool
 
     registry = ToolRegistry()
     registry.register(ListFilesTool())
@@ -147,4 +163,15 @@ def create_default_registry() -> ToolRegistry:
     registry.register(WriteFileTool())
     registry.register(ApplyPatchTool())
     registry.register(RunCommandTool())
+    registry.register(RAGRetrieveTool())
+
+    if workspace is not None:
+        try:
+            ws_path = getattr(workspace, "root", workspace)
+            from termicode.tools.toolbridge import discover_and_register_mcp_tools
+
+            discover_and_register_mcp_tools(registry, ws_path)
+        except Exception:
+            pass
+
     return registry

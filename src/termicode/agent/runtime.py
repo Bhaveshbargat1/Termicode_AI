@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
-from typing import Any
 
 from termicode.agent.memory import (
     ApprovedActionRecord,
@@ -24,7 +24,7 @@ from termicode.agent.models import (
 )
 from termicode.agent.policy import PolicyEngine
 from termicode.agent.transcript import TranscriptWriter
-from termicode.agent.workflows import get_workflow_profile
+from termicode.agent.workflows import WorkflowType, get_workflow_profile
 from termicode.providers.base import (
     ChatMessage,
     CompletionRequest,
@@ -35,8 +35,9 @@ from termicode.providers.base import (
     ToolDeclaration,
 )
 from termicode.providers.redaction import redact_secrets
-from termicode.tools.base import ToolContext
+from termicode.tools.base import RiskLevel, ToolContext
 from termicode.tools.registry import ToolRegistry
+from termicode.version_control import CheckpointManager, GitCheckpoint, is_git_repo
 
 MAX_TOOL_OUTPUT_CHARS = 16384
 
@@ -54,14 +55,24 @@ class AgentRuntime:
         registry: ToolRegistry,
         policy_engine: PolicyEngine | None = None,
         approval_handler: Callable[[ProposedAction, PolicyDecision], bool] | None = None,
-        step_callback: Callable[[int, int, str, dict[str, Any]], None] | None = None,
+        rollback_handler: Callable[[GitCheckpoint, str], bool] | None = None,
+        step_callback: Callable[..., None] | None = None,
+        debug: bool = False,
     ) -> None:
         self._provider = provider
         self._registry = registry
         self._policy_engine = policy_engine or PolicyEngine(registry)
         # Default approval handler: denies execution unless explicitly authorized
         self._approval_handler = approval_handler or (lambda _act, _dec: False)
+        self._rollback_handler = rollback_handler
         self._step_callback = step_callback
+        self.debug = debug
+
+    def _print_debug(self, message: str) -> None:
+        """Output debug trace when debug mode is enabled."""
+        from termicode.console import console
+
+        console.print(f"[dim blue][DEBUG][/dim blue] {message}")
 
     def run(self, request: AgentRequest) -> RunResult:
         """Synchronously execute the bounded agent loop."""
@@ -70,12 +81,74 @@ class AgentRuntime:
         max_steps = (
             request.max_steps if request.max_steps is not None else profile.maximum_step_budget
         )
+        is_debug = self.debug or getattr(request, "debug", False)
         transcript = TranscriptWriter(request.workspace, run_id=run_id)
         memory = LocalMemory(request.workspace)
 
         approved_actions: list[ApprovedActionRecord] = []
         command_records: list[CommandExecutionRecord] = []
         unresolved_issues: list[str] = []
+        action_history: list[tuple[str, str]] = []
+
+        checkpoint_mgr: CheckpointManager | None = None
+        if is_git_repo(request.workspace.root):
+            checkpoint_mgr = CheckpointManager(request.workspace.root)
+            if checkpoint_mgr.has_uncommitted_changes():
+                uncommitted_list = checkpoint_mgr.get_uncommitted_changes()
+                if is_debug:
+                    self._print_debug(
+                        f"[Version Control] Uncommitted changes detected: {uncommitted_list}"
+                    )
+                transcript.log_event(
+                    "uncommitted_changes_detected", 0, {"files": uncommitted_list}
+                )
+
+        active_checkpoints: list[GitCheckpoint] = []
+        rolled_back = False
+        rollback_cp_id: str | None = None
+        committed_hash: str | None = None
+
+        def trigger_rollback(reason: str) -> bool:
+            nonlocal rolled_back, rollback_cp_id
+            if not active_checkpoints or checkpoint_mgr is None or rolled_back:
+                return False
+            # Revert to initial checkpoint before mutations began in this run
+            target_cp = active_checkpoints[0]
+            should = True
+            if self._rollback_handler is not None:
+                should = self._rollback_handler(target_cp, reason)
+            elif not getattr(request, "auto_rollback", True):
+                should = False
+            if should:
+                try:
+                    checkpoint_mgr.rollback(target_cp.id)
+                    rolled_back = True
+                    rollback_cp_id = target_cp.id
+                    if is_debug:
+                        self._print_debug(
+                            f"[Version Control] Rolled back workspace to "
+                            f"checkpoint '{target_cp.id}'"
+                        )
+                    transcript.log_event(
+                        "checkpoint_rollback",
+                        state.steps_used,
+                        {"id": target_cp.id, "reason": reason},
+                    )
+                    unresolved_issues.append(
+                        f"Workspace rolled back to checkpoint '{target_cp.id}' ({reason})."
+                    )
+                    return True
+                except Exception as ex:
+                    unresolved_issues.append(
+                        f"Failed to rollback to checkpoint '{target_cp.id}': {ex}"
+                    )
+            return False
+
+        if is_debug:
+            self._print_debug(
+                f"[Planner] Initiated agent loop for task: '{request.task}' "
+                f"(workflow: '{profile.name}', max_steps: {max_steps})"
+            )
 
         transcript.log_event(
             "run_start",
@@ -98,7 +171,23 @@ class AgentRuntime:
         # Prepare tool declarations matching the active workflow profile
         allowed_tools = self._registry.filter_by_risk(profile.allowed_risk_levels)
         if profile.allowed_tools is not None:
-            allowed_tools = [t for t in allowed_tools if t.name in profile.allowed_tools]
+            task_lower = request.task.lower()
+            is_rag_task = any(
+                kw in task_lower for kw in ("rag", "retrieve", "document", "pdf", "page")
+            )
+            allowed_tools = [
+                t
+                for t in allowed_tools
+                if t.name in profile.allowed_tools
+                or getattr(t, "is_mcp", False)
+                or (
+                    getattr(t, "is_rag", False)
+                    and (
+                        profile.name not in (WorkflowType.UNDERSTAND, WorkflowType.REVIEW)
+                        or is_rag_task
+                    )
+                )
+            ]
 
         tool_declarations = [
             ToolDeclaration(
@@ -110,6 +199,7 @@ class AgentRuntime:
         ]
 
         # The bounded agent loop
+        last_tc_name = "unknown"
         while state.steps_used < max_steps:
             # 1. Enforce repair budget
             if state.repairs_used >= request.max_repairs:
@@ -156,10 +246,15 @@ class AgentRuntime:
                 )
                 continue
 
+            if is_debug and response.content:
+                self._print_debug(f"[Planner] Reasoning / Plan: {response.content.strip()}")
+
             # 3. Model completed without tool calls
             if not response.tool_calls:
                 state.stop_reason = StopReason.COMPLETED
                 final_content = response.content or "(Task finished without textual explanation.)"
+                if is_debug:
+                    self._print_debug(f"[Final Answer] {final_content}")
                 state.messages.append(
                     ChatMessage(role=MessageRole.ASSISTANT, content=final_content)
                 )
@@ -170,10 +265,32 @@ class AgentRuntime:
 
             # 4. Extract single next tool proposal
             tc = response.tool_calls[0]
+            last_tc_name = tc.name
             state.steps_used += 1
 
+            # Identify tool category: local, rag, or mcp
+            tool_obj = self._registry.get(tc.name) if self._registry.has(tc.name) else None
+            if getattr(tool_obj, "is_mcp", False):
+                tool_category = "mcp"
+            elif getattr(tool_obj, "is_rag", False) or tc.name == "rag_retrieve":
+                tool_category = "rag"
+            else:
+                tool_category = "local"
+
+            if is_debug:
+                self._print_debug(
+                    f"[Tool Selection] Step {state.steps_used}/{max_steps}: "
+                    f"Selected {tool_category.upper()} tool '{tc.name}' "
+                    f"with arguments: {tc.arguments}"
+                )
+
             if self._step_callback is not None:
-                self._step_callback(state.steps_used, max_steps, tc.name, tc.arguments)
+                try:
+                    self._step_callback(
+                        state.steps_used, max_steps, tc.name, tc.arguments, tool_category
+                    )
+                except TypeError:
+                    self._step_callback(state.steps_used, max_steps, tc.name, tc.arguments)
 
             action = ProposedAction(
                 kind="tool_call",
@@ -184,8 +301,47 @@ class AgentRuntime:
             transcript.log_event(
                 "proposed_action",
                 state.steps_used,
-                {"id": tc.id, "tool": tc.name, "arguments": tc.arguments},
+                {
+                    "id": tc.id,
+                    "tool": tc.name,
+                    "arguments": tc.arguments,
+                    "category": tool_category,
+                },
             )
+
+            # 4b. Loop repetition guard
+            if getattr(request, "repetition_guard", False):
+                action_sig = (tc.name, json.dumps(tc.arguments, sort_keys=True))
+                action_history.append(action_sig)
+                threshold = getattr(request, "repetition_threshold", 3)
+                if (
+                    len(action_history) >= threshold
+                    and all(sig == action_sig for sig in action_history[-threshold:])
+                ):
+                    guard_msg = (
+                        f"Loop guard: Detected repeated execution of {tool_category.upper()} tool "
+                        f"'{tc.name}' with identical arguments without forward progress. "
+                        "Halting loop."
+                    )
+                    if is_debug:
+                        self._print_debug(f"[Loop Guard] {guard_msg}")
+                    state.stop_reason = StopReason.ERROR
+                    unresolved_issues.append(guard_msg)
+                    transcript.log_event(
+                        "repetition_detected",
+                        state.steps_used,
+                        {"tool": tc.name, "arguments": tc.arguments, "category": tool_category},
+                    )
+                    state.messages.append(ChatMessage(role=MessageRole.ASSISTANT, tool_calls=[tc]))
+                    state.messages.append(
+                        ChatMessage(
+                            role=MessageRole.TOOL,
+                            tool_call_id=tc.id,
+                            name=tc.name,
+                            content=guard_msg,
+                        )
+                    )
+                    break
 
             # 5. Policy evaluation
             decision = self._policy_engine.evaluate(action, profile, request.workspace)
@@ -236,12 +392,21 @@ class AgentRuntime:
             # 6. User approval determination
             user_approved = True
             if decision.status == "needs_approval":
+                if is_debug:
+                    self._print_debug(
+                        f"[Approval Gate] Action requires confirmation for "
+                        f"{tool_category.upper()} tool '{tc.name}'"
+                    )
                 transcript.log_event(
                     "approval_requested",
                     state.steps_used,
-                    {"tool": tc.name, "preview": decision.preview},
+                    {"tool": tc.name, "preview": decision.preview, "category": tool_category},
                 )
                 user_approved = self._approval_handler(action, decision)
+                if is_debug:
+                    self._print_debug(
+                        f"[Approval Gate] Decision: {'APPROVED' if user_approved else 'DENIED'}"
+                    )
                 transcript.log_event(
                     "approval_determination",
                     state.steps_used,
@@ -268,7 +433,43 @@ class AgentRuntime:
                             content="User cancelled execution: Action was denied by approval gate.",
                         )
                     )
+                    trigger_rollback(f"User cancelled action '{tc.name}'")
                     break
+
+            # 6b. Checkpoint before file-modifying tools
+            is_file_modifying_tool = (
+                tool_obj is not None
+                and (
+                    tool_obj.risk_level == RiskLevel.WRITE
+                    or tc.name in ("write_file", "apply_patch")
+                )
+            )
+            if (
+                is_file_modifying_tool
+                and checkpoint_mgr is not None
+                and getattr(request, "checkpoint_on_mutate", True)
+            ):
+                try:
+                    cp = checkpoint_mgr.create_checkpoint(
+                        message=f"Auto checkpoint before '{tc.name}' (step {state.steps_used})",
+                        checkpoint_type="auto",
+                    )
+                    active_checkpoints.append(cp)
+                    if is_debug:
+                        self._print_debug(
+                            f"[Version Control] Created auto checkpoint '{cp.id}' "
+                            f"before '{tc.name}'"
+                        )
+                    transcript.log_event(
+                        "checkpoint_created",
+                        state.steps_used,
+                        {"id": cp.id, "tool": tc.name},
+                    )
+                except Exception as ex:
+                    if is_debug:
+                        self._print_debug(
+                            f"[Version Control] Warning: Failed to create checkpoint: {ex}"
+                        )
 
             # 7. Execute tool proposal
             tool_ctx = ToolContext(
@@ -278,11 +479,23 @@ class AgentRuntime:
                 user_confirmed=user_approved,
             )
 
+            if is_debug:
+                self._print_debug(
+                    f"[Execution] Executing {tool_category.upper()} tool '{tc.name}'..."
+                )
+
             tool_result = self._registry.execute(
                 tc.name,
                 tc.arguments,
                 context=tool_ctx,
             )
+
+            if is_debug:
+                preview = (tool_result.output if tool_result.ok else tool_result.error) or ""
+                self._print_debug(
+                    f"[Execution] Completed ok={tool_result.ok}, "
+                    f"output preview: {preview[:100].strip()}"
+                )
 
             transcript.log_event(
                 "tool_execution",
@@ -291,6 +504,7 @@ class AgentRuntime:
                     "ok": tool_result.ok,
                     "changed_files": tool_result.changed_files,
                     "error": tool_result.error,
+                    "category": tool_category,
                 },
             )
 
@@ -360,6 +574,7 @@ class AgentRuntime:
                             content=output_err,
                         )
                     )
+                    trigger_rollback(f"Tool '{tc.name}' execution failed and max repairs exhausted")
                     break
 
             # Bound output content length
@@ -373,6 +588,11 @@ class AgentRuntime:
                 )
             else:
                 output_content = raw_output
+
+            if is_debug:
+                self._print_debug(
+                    f"[Observation] Fed observation back to agent ({len(output_content)} chars)"
+                )
 
             # Append to message history
             state.messages.append(ChatMessage(role=MessageRole.ASSISTANT, tool_calls=[tc]))
@@ -400,6 +620,33 @@ class AgentRuntime:
         elif state.stop_reason == StopReason.ERROR:
             unresolved_issues.append("Run terminated due to an unrecoverable error.")
 
+        # Trigger rollback if the run did not complete successfully and hasn't rolled back yet
+        if state.stop_reason != StopReason.COMPLETED and not rolled_back:
+            trigger_rollback(f"Task concluded with stop reason '{state.stop_reason.value}'")
+
+        # Optional auto-commit upon successful plan completion
+        if (
+            state.stop_reason == StopReason.COMPLETED
+            and getattr(request, "auto_commit", False)
+            and checkpoint_mgr is not None
+        ):
+            tests_ok = all(cmd.ok for cmd in command_records if cmd.is_test)
+            if tests_ok:
+                c_msg = getattr(request, "commit_message", None) or f"TermiCode: {request.task}"
+                try:
+                    committed_hash = checkpoint_mgr.commit_changes(c_msg)
+                    if is_debug:
+                        self._print_debug(
+                            f"[Version Control] Committed changes: {c_msg} ({committed_hash})"
+                        )
+                    transcript.log_event(
+                        "commit_created",
+                        state.steps_used,
+                        {"commit": committed_hash, "message": c_msg},
+                    )
+                except Exception as ex:
+                    unresolved_issues.append(f"Failed to commit changes: {ex}")
+
         # Determine summary text
         summary = ""
         for msg in reversed(state.messages):
@@ -407,11 +654,33 @@ class AgentRuntime:
                 summary = msg.content
                 break
 
-        if not summary:
-            summary = (
-                f"Run stopped with status '{state.stop_reason.value}' after "
-                f"{state.steps_used} steps and {state.repairs_used} repairs."
-            )
+        if not summary or state.stop_reason != StopReason.COMPLETED:
+            if any(
+                "Loop guard: Detected repeated execution" in iss for iss in unresolved_issues
+            ):
+                summary = (
+                    f"Repetition loop detected: The agent repeatedly attempted "
+                    f"tool '{last_tc_name}' without making progress. "
+                    "Please clarify or check preconditions."
+                )
+            elif state.stop_reason == StopReason.MAX_STEPS_REACHED:
+                last_issue = unresolved_issues[-1] if unresolved_issues else "Incomplete task"
+                summary = (
+                    f"Task halted: Maximum step budget ({max_steps}) reached before completion. "
+                    f"Last unresolved issue: {last_issue}."
+                )
+            elif state.stop_reason == StopReason.USER_CANCELLED:
+                summary = "Task halted: User cancelled execution during approval confirmation."
+            elif state.stop_reason == StopReason.POLICY_REJECTED:
+                summary = (
+                    f"Task halted: Policy rejected action ("
+                    f"{unresolved_issues[-1] if unresolved_issues else 'Prohibited action'})."
+                )
+            elif not summary:
+                summary = (
+                    f"Run stopped with status '{state.stop_reason.value}' after "
+                    f"{state.steps_used} steps and {state.repairs_used} repairs."
+                )
 
         transcript.log_event(
             "run_stop",
@@ -452,6 +721,9 @@ class AgentRuntime:
             tests_run=state.tests_run,
             transcript_path=transcript.path,
             run_summary=run_summary,
+            rolled_back=rolled_back,
+            rollback_checkpoint_id=rollback_cp_id,
+            committed_hash=committed_hash,
         )
 
     async def arun(self, request: AgentRequest) -> RunResult:

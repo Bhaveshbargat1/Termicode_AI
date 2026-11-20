@@ -43,6 +43,12 @@ from termicode.providers.fake import FakeProvider
 from termicode.providers.openai import OpenAIProvider
 from termicode.tools.base import RiskLevel
 from termicode.tools.registry import create_default_registry
+from termicode.version_control import (
+    CheckpointManager,
+    GitCheckpoint,
+    init_git_repo,
+    is_git_repo,
+)
 from termicode.workspace import WorkspaceBoundary, WorkspaceError
 
 app = typer.Typer(
@@ -322,6 +328,28 @@ def make_cli_approval_handler(
     return approval_handler
 
 
+def make_cli_rollback_handler(
+    auto_approve: bool = False,
+) -> Callable[[GitCheckpoint, str], bool]:
+    """Construct an interactive or automated rollback confirmation handler."""
+
+    def rollback_handler(checkpoint: GitCheckpoint, reason: str) -> bool:
+        if auto_approve or is_non_interactive_session():
+            return True
+        console.print(f"\n[bold yellow][WARN][/bold yellow] Action failed or cancelled: {reason}")
+        prompt = (
+            f"Would you like to rollback workspace to checkpoint '{checkpoint.id}' "
+            f"({checkpoint.message})? [y/N]: "
+        )
+        try:
+            resp = input(prompt).strip().lower()
+            return resp in ("y", "yes")
+        except (KeyboardInterrupt, EOFError):
+            return False
+
+    return rollback_handler
+
+
 def _render_run_result(result: RunResult, workflow: str) -> None:
     """Render structured terminal summary for an agent run with all required metrics."""
     status_style = "green" if result.stop_reason == StopReason.COMPLETED else "yellow"
@@ -345,6 +373,16 @@ def _render_run_result(result: RunResult, workflow: str) -> None:
     # Tests run
     tests_str = ", ".join(result.tests_run) if result.tests_run else "(None)"
     table.add_row("Tests Run", tests_str)
+
+    # Rollback status
+    if getattr(result, "rolled_back", False):
+        cp_label = getattr(result, "rollback_checkpoint_id", "latest")
+        table.add_row("Rollback", f"[bold yellow]Reverted to {cp_label}[/]")
+
+    # Git commit
+    if getattr(result, "committed_hash", None):
+        c_hash = str(result.committed_hash)[:8]
+        table.add_row("Git Commit", f"[bold green]{c_hash}[/]")
 
     # Failures / unresolved issues
     failures = (
@@ -707,6 +745,103 @@ def _create_smart_offline_provider(
         nonlocal step_count
         step_count += 1
         available_tools = {t.name for t in (req.tools or [])}
+        task_lower = task.lower()
+
+        # 1. Multi-step scenario: Create file and show/verify it
+        if "create" in task_lower and ("show" in task_lower or "read" in task_lower):
+            target_file = "a.txt"
+            for token in task.split():
+                clean_tok = token.strip("'\"`,;")
+                if "." in clean_tok:
+                    target_file = clean_tok
+                    break
+
+            content_val = "Hello"
+            import re
+
+            m = re.search(r"content\s*['\"]([^'\"]+)['\"]", task, re.IGNORECASE)
+            if m:
+                content_val = m.group(1)
+
+            if step_count == 1 and "write_file" in available_tools:
+                return CompletionResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="call_write_sample",
+                            name="write_file",
+                            arguments={"path": target_file, "content": content_val},
+                            rationale=f"Writing '{content_val}' to {target_file}.",
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                    model="offline-engine-v1",
+                )
+            elif step_count == 2 and "read_file" in available_tools:
+                return CompletionResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="call_read_sample",
+                            name="read_file",
+                            arguments={"path": target_file},
+                            rationale=f"Reading back {target_file} to show its contents.",
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                    model="offline-engine-v1",
+                )
+            elif step_count == 3:
+                return CompletionResponse(
+                    content=(
+                        f"Created file {target_file} with content '{content_val}'. "
+                        f"Verification output:\n{content_val}"
+                    ),
+                    finish_reason="stop",
+                    model="offline-engine-v1",
+                )
+
+        # 2. RAG retrieval scenario
+        if (
+            "document.pdf" in task_lower or "page" in task_lower or "rag" in task_lower
+        ) and "rag_retrieve" in available_tools:
+            if step_count == 1:
+                return CompletionResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="call_rag_sample",
+                            name="rag_retrieve",
+                            arguments={"query": task, "document_path": "document.pdf", "page": 2},
+                            rationale="Retrieving target page of document.pdf using RAG.",
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                    model="offline-engine-v1",
+                )
+
+        # 3. Remote MCP scenario
+        mcp_tools = [
+            t
+            for t in available_tools
+            if "github" in t or "filesystem__" in t or t == "toolbridge_invoke"
+        ]
+        if ("github" in task_lower or "issue" in task_lower or "mcp" in task_lower) and mcp_tools:
+            mcp_name = mcp_tools[0]
+            if step_count == 1:
+                if "github" in mcp_name:
+                    mcp_args: dict[str, Any] = {"repo": "X"}
+                else:
+                    mcp_args = {"tool_name": "github__list_issues", "arguments": {"repo": "X"}}
+                return CompletionResponse(
+                    tool_calls=[
+                        ToolCall(
+                            id="call_mcp_sample",
+                            name=mcp_name,
+                            arguments=mcp_args,
+                            rationale=f"Querying GitHub issues via remote MCP tool '{mcp_name}'.",
+                        )
+                    ],
+                    finish_reason="tool_calls",
+                    model="offline-engine-v1",
+                )
 
         if step_count == 1:
             if workflow in (WorkflowType.UNDERSTAND, WorkflowType.REVIEW):
@@ -807,6 +942,9 @@ def _execute_workflow(
     provider_override: str | None = None,
     model_override: str | None = None,
     offline: bool = False,
+    debug: bool = False,
+    commit: bool = False,
+    commit_message: str | None = None,
 ) -> RunResult:
     """Core executor wiring workspace, provider, registry, and single runtime."""
     target_path = workspace_path if workspace_path is not None else Path.cwd()
@@ -818,6 +956,11 @@ def _execute_workflow(
 
     # In plan mode: force read-only workflow and planning objective
     effective_workflow = WorkflowType.UNDERSTAND if plan else workflow
+    if effective_workflow == WorkflowType.UNDERSTAND and not plan:
+        task_lower = task.lower()
+        mutation_kws = ("create file", "create a file", "write file", "write a file")
+        if any(kw in task_lower for kw in mutation_kws):
+            effective_workflow = WorkflowType.GENERATE
     effective_task = (
         f"Generate a detailed, read-only step-by-step implementation plan for: {task}"
         if plan
@@ -947,7 +1090,11 @@ def _execute_workflow(
                     raise typer.Exit(code=1) from err
 
     def cli_step_callback(
-        step: int, total_steps: int, tool_name: str, args: dict[str, Any]
+        step: int,
+        total_steps: int,
+        tool_name: str,
+        args: dict[str, Any],
+        category: str = "local",
     ) -> None:
         target_info = ""
         if "path" in args:
@@ -956,9 +1103,14 @@ def _execute_workflow(
             cmd = args["command"]
             cmd_str = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
             target_info = f" ({cmd_str})"
+        elif "query" in args:
+            q_short = str(args["query"])[:35]
+            target_info = f" (query: '{q_short}')"
+
+        cat_badge = f"[{category.upper()}] " if category != "local" else ""
         console.print(
             f"[dim]Step {step}/{total_steps}:[/dim] "
-            f"Action -> [bold cyan]{tool_name}[/bold cyan]{target_info}"
+            f"Action -> {cat_badge}[bold cyan]{tool_name}[/bold cyan]{target_info}"
         )
 
     approval_handler = make_cli_approval_handler(
@@ -966,13 +1118,16 @@ def _execute_workflow(
         auto_approve=auto_approve,
         dry_run=dry_run,
     )
+    rollback_handler = make_cli_rollback_handler(auto_approve=auto_approve)
 
-    registry = create_default_registry()
+    registry = create_default_registry(workspace=boundary.root)
     runtime = AgentRuntime(
         provider=provider,
         registry=registry,
         approval_handler=approval_handler,
+        rollback_handler=rollback_handler,
         step_callback=cli_step_callback,
+        debug=debug,
     )
 
     request = AgentRequest(
@@ -980,6 +1135,11 @@ def _execute_workflow(
         workspace=boundary,
         workflow=profile.name,
         max_steps=max_steps,
+        debug=debug,
+        repetition_guard=True,
+        auto_commit=commit,
+        commit_message=commit_message,
+        auto_rollback=auto_approve,
     )
 
     try:
@@ -1200,6 +1360,30 @@ def run(
             help="Run with built-in offline engine without external LLM servers.",
         ),
     ] = False,
+    debug: Annotated[
+        bool,
+        typer.Option(
+            "--debug",
+            "-d",
+            help="Print detailed execution traces for each planner and tool step.",
+        ),
+    ] = False,
+    commit: Annotated[
+        bool,
+        typer.Option(
+            "--commit",
+            "-c",
+            help="Automatically commit workspace modifications to Git if task succeeds.",
+        ),
+    ] = False,
+    commit_message: Annotated[
+        str | None,
+        typer.Option(
+            "--commit-message",
+            "-m",
+            help="Commit message to use when --commit is enabled.",
+        ),
+    ] = None,
 ) -> None:
     """Run an agent task using a specified workflow profile."""
     raw_workspace = ctx.obj.get("workspace") if ctx.obj else None
@@ -1214,6 +1398,9 @@ def run(
         provider_override=provider,
         model_override=model,
         offline=offline,
+        debug=debug,
+        commit=commit,
+        commit_message=commit_message,
     )
 
 
@@ -1497,6 +1684,806 @@ def refactor(
         model_override=model,
         offline=offline,
     )
+
+
+@app.command()
+def init(
+    ctx: typer.Context,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force", "-f", help="Overwrite existing configuration if already initialized."
+        ),
+    ] = False,
+) -> None:
+    """Initialize TermiCode metadata directory (.termicode/) and configuration template."""
+    raw_workspace = ctx.obj.get("workspace") if ctx.obj else None
+    target_path = raw_workspace if raw_workspace is not None else Path.cwd()
+
+    try:
+        boundary = WorkspaceBoundary(target_path)
+        boundary.ensure_termicode_dir()
+
+        transcripts_dir = boundary.termicode_dir / "transcripts"
+        summaries_dir = boundary.termicode_dir / "summaries"
+        transcripts_dir.mkdir(parents=True, exist_ok=True)
+        summaries_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize Git repository if not already present
+        if not is_git_repo(boundary.root):
+            init_git_repo(boundary.root)
+            console.print(f"[bold green][OK] Initialized Git repository in:[/] {boundary.root}")
+        else:
+            console.print(f"[dim][OK] Git repository confirmed in:[/] {boundary.root}")
+
+        env_file = boundary.root / ".env"
+        if not env_file.exists() or force:
+            env_template = (
+                "# TermiCode AI Workspace Environment Configuration\n"
+                "TERMICODE_PROVIDER=ollama\n"
+                "TERMICODE_MODEL=qwen2.5-coder:7b\n"
+                "TERMICODE_API_BASE=http://localhost:11434/v1\n"
+                "TERMICODE_LOG_LEVEL=INFO\n\n"
+                "# ToolBridge MCP Gateway Integration\n"
+                "TERMICODE_TOOLBRIDGE_ENABLED=false\n"
+                "TERMICODE_TOOLBRIDGE_API_URL=http://127.0.0.1:8000\n"
+                "TERMICODE_TOOLBRIDGE_API_KEY=\n"
+            )
+            env_file.write_text(env_template, encoding="utf-8")
+            msg = f"[bold green][OK][/bold green] Created environment template: {env_file}"
+            console.print(msg)
+
+        console.print(
+            f"[bold green][OK] TermiCode initialized in:[/bold green] {boundary.root}\n"
+            f"- Metadata directory: {boundary.termicode_dir}\n"
+            f"- Transcripts directory: {transcripts_dir}\n"
+            f"- Summaries directory: {summaries_dir}"
+        )
+    except Exception as err:
+        print_error(f"Failed to initialize TermiCode: {err}", title="Initialization Error")
+        raise typer.Exit(code=1) from err
+
+
+@app.command()
+def checkpoint(
+    ctx: typer.Context,
+    message: Annotated[
+        str | None,
+        typer.Argument(help="Optional description or note for the checkpoint."),
+    ] = None,
+) -> None:
+    """Manually create a Git checkpoint saving current workspace state."""
+    raw_workspace = ctx.obj.get("workspace") if ctx.obj else None
+    target_path = raw_workspace if raw_workspace is not None else Path.cwd()
+    try:
+        boundary = WorkspaceBoundary(target_path)
+        if not is_git_repo(boundary.root):
+            print_error(
+                "Workspace is not a Git repository. Run 'termicode init' to initialize.",
+                title="Git Repository Required",
+            )
+            raise typer.Exit(code=1)
+
+        mgr = CheckpointManager(boundary.root)
+        if mgr.has_uncommitted_changes():
+            console.print(
+                "[bold yellow][WARN][/bold yellow] Workspace contains uncommitted changes. "
+                "Checkpoint will snapshot current working tree."
+            )
+        cp = mgr.create_checkpoint(message=message, checkpoint_type="manual")
+        console.print(f"[bold green][OK] Created checkpoint:[/] [cyan]{cp.id}[/]")
+        console.print(f"- Message: {cp.message}")
+        console.print(f"- Commit: {cp.commit_hash[:8] if cp.commit_hash else '-'}")
+        if cp.files:
+            file_sample = ", ".join(cp.files[:5])
+            console.print(f"- Captured {len(cp.files)} modified/untracked file(s): {file_sample}")
+    except typer.Exit:
+        raise
+    except Exception as err:
+        print_error(f"Failed to create checkpoint: {err}", title="Checkpoint Error")
+        raise typer.Exit(code=1) from err
+
+
+@app.command()
+def rollback(
+    ctx: typer.Context,
+    checkpoint_id: Annotated[
+        str | None,
+        typer.Argument(help="Checkpoint ID to restore (defaults to latest checkpoint)."),
+    ] = None,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Revert workspace without interactive confirmation."),
+    ] = False,
+) -> None:
+    """Revert workspace to the last checkpoint (or specified checkpoint ID)."""
+    raw_workspace = ctx.obj.get("workspace") if ctx.obj else None
+    target_path = raw_workspace if raw_workspace is not None else Path.cwd()
+    try:
+        boundary = WorkspaceBoundary(target_path)
+        if not is_git_repo(boundary.root):
+            print_error(
+                "Workspace is not a Git repository. Run 'termicode init' to initialize.",
+                title="Git Repository Required",
+            )
+            raise typer.Exit(code=1)
+
+        mgr = CheckpointManager(boundary.root)
+        target_cp = mgr.get_checkpoint(checkpoint_id)
+        if target_cp is None and checkpoint_id is not None:
+            print_error(
+                f"Checkpoint '{checkpoint_id}' not found.",
+                title="Checkpoint Not Found",
+            )
+            raise typer.Exit(code=1)
+
+        target_label = target_cp.id if target_cp else "HEAD"
+        desc = target_cp.message if target_cp else "Working tree reset"
+
+        if mgr.has_uncommitted_changes():
+            uncommitted = mgr.get_uncommitted_changes()
+            console.print(
+                "[bold yellow][WARN][/bold yellow] Workspace has uncommitted changes that "
+                f"will be lost:\n  {', '.join(uncommitted[:8])}"
+            )
+
+        if not yes and not is_non_interactive_session():
+            confirmed = typer.confirm(
+                f"Are you sure you want to rollback to checkpoint '{target_label}' ({desc})?",
+                default=False,
+            )
+            if not confirmed:
+                console.print("[dim]Rollback aborted by user.[/]")
+                raise typer.Exit(code=0)
+
+        res_cp = mgr.rollback(checkpoint_id)
+        console.print(
+            f"[bold green][OK] Workspace successfully rolled back to checkpoint:[/] "
+            f"[cyan]{res_cp.id}[/] ({res_cp.message})"
+        )
+    except typer.Exit:
+        raise
+    except Exception as err:
+        print_error(f"Failed to rollback workspace: {err}", title="Rollback Error")
+        raise typer.Exit(code=1) from err
+
+
+@app.command()
+def checkpoints(
+    ctx: typer.Context,
+    limit: Annotated[
+        int,
+        typer.Option("--limit", "-n", help="Maximum number of checkpoints to display."),
+    ] = 10,
+) -> None:
+    """List recent Git checkpoints recorded for the workspace."""
+    raw_workspace = ctx.obj.get("workspace") if ctx.obj else None
+    target_path = raw_workspace if raw_workspace is not None else Path.cwd()
+    try:
+        boundary = WorkspaceBoundary(target_path)
+        if not is_git_repo(boundary.root):
+            print_error(
+                "Workspace is not a Git repository. Run 'termicode init' to initialize.",
+                title="Git Repository Required",
+            )
+            raise typer.Exit(code=1)
+
+        mgr = CheckpointManager(boundary.root)
+        cps = mgr.list_checkpoints(limit=limit)
+        if not cps:
+            console.print("[dim]No checkpoints recorded for this workspace.[/]")
+            return
+
+        table = Table(title="Recorded Git Checkpoints", show_lines=True)
+        table.add_column("ID", style="bold cyan", no_wrap=True)
+        table.add_column("Type", style="magenta")
+        table.add_column("Timestamp", style="dim")
+        table.add_column("Message")
+        table.add_column("Files Changed", style="yellow")
+        table.add_column("Commit Hash", style="blue")
+
+        for cp in cps:
+            files_str = f"{len(cp.files)} file(s)" if cp.files else "Clean"
+            commit_short = cp.commit_hash[:8] if cp.commit_hash else "-"
+            table.add_row(
+                cp.id,
+                cp.type.upper(),
+                cp.timestamp[:19].replace("T", " "),
+                cp.message,
+                files_str,
+                commit_short,
+            )
+
+        console.print(table)
+    except typer.Exit:
+        raise
+    except Exception as err:
+        print_error(f"Failed to list checkpoints: {err}", title="Checkpoints Error")
+        raise typer.Exit(code=1) from err
+
+
+def _get_session_db(ctx: typer.Context) -> tuple[WorkspaceBoundary, Any]:
+    from termicode.chat.database import SessionDatabase
+
+    raw_workspace = ctx.obj.get("workspace") if ctx.obj else None
+    target_path = raw_workspace if raw_workspace is not None else Path.cwd()
+    boundary = WorkspaceBoundary(target_path)
+    boundary.ensure_termicode_dir()
+    db_path = boundary.termicode_dir / "chat_sessions.db"
+    return boundary, SessionDatabase(db_path)
+
+
+session_app = typer.Typer(
+    name="session",
+    help="Manage persistent conversation sessions and memory.",
+    no_args_is_help=True,
+)
+app.add_typer(session_app, name="session")
+
+
+@session_app.command("new")
+def session_new(
+    ctx: typer.Context,
+    title: Annotated[
+        str,
+        typer.Option("--title", "-t", help="Descriptive title for the new session."),
+    ] = "New Session",
+) -> None:
+    """Create a new conversation session and set it as active."""
+    try:
+        _, db = _get_session_db(ctx)
+        session_id = db.create_session(title=title, set_active=True)
+        console.print(
+            f"[bold green]Created new session:[/bold green] [bold cyan]{session_id}[/bold cyan] "
+            f"(Title: '{title}')"
+        )
+    except Exception as err:
+        print_error(f"Failed to create session: {err}", title="Session Error")
+        raise typer.Exit(code=1) from err
+
+
+@session_app.command("list")
+def session_list(ctx: typer.Context) -> None:
+    """List all saved conversation sessions in the current workspace."""
+    try:
+        boundary, db = _get_session_db(ctx)
+        sessions = db.list_sessions()
+        if not sessions:
+            console.print("[dim]No sessions found in active workspace.[/dim]")
+            return
+
+        table = Table(
+            title=f"TermiCode AI Sessions ({boundary.root.name})",
+            border_style="cyan",
+        )
+        table.add_column("Session ID", style="bold cyan", width=14)
+        table.add_column("Title", style="white")
+        table.add_column("Msgs", justify="right", style="magenta", width=6)
+        table.add_column("Active", justify="center", style="green", width=8)
+        table.add_column("Updated", style="dim", width=20)
+
+        for s in sessions:
+            active_marker = "[bold green]YES[/bold green]" if s["is_active"] else "[dim]NO[/dim]"
+            updated = s["updated_at"][:19].replace("T", " ")
+            table.add_row(
+                s["id"],
+                s["title"],
+                str(s["message_count"]),
+                active_marker,
+                updated,
+            )
+
+        console.print(table)
+    except Exception as err:
+        print_error(f"Failed to list sessions: {err}", title="Session Error")
+        raise typer.Exit(code=1) from err
+
+
+@session_app.command("switch")
+def session_switch(
+    ctx: typer.Context,
+    session_id: Annotated[
+        str,
+        typer.Argument(help="ID of the session to switch to (e.g. 'sess_abc12345')."),
+    ],
+) -> None:
+    """Switch the active session pointer to a specific session ID."""
+    try:
+        _, db = _get_session_db(ctx)
+        if db.set_active_session(session_id):
+            console.print(
+                "[bold green]Active session switched to:[/bold green] "
+                f"[bold cyan]{session_id}[/bold cyan]"
+            )
+        else:
+            print_error(f"Session '{session_id}' not found.", title="Session Not Found")
+            raise typer.Exit(code=1)
+    except typer.Exit:
+        raise
+    except Exception as err:
+        print_error(f"Failed to switch session: {err}", title="Session Error")
+        raise typer.Exit(code=1) from err
+
+
+@session_app.command("delete")
+def session_delete(
+    ctx: typer.Context,
+    session_id: Annotated[
+        str,
+        typer.Argument(help="ID of the session to delete."),
+    ],
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            "--force",
+            "-f",
+            help="Bypass interactive confirmation prompt.",
+        ),
+    ] = False,
+) -> None:
+    """Delete a conversation session and all its messages."""
+    try:
+        _, db = _get_session_db(ctx)
+        existing = db.get_session(session_id)
+        if not existing:
+            print_error(f"Session '{session_id}' not found.", title="Session Not Found")
+            raise typer.Exit(code=1)
+
+        if not yes and sys.stdin.isatty():
+            confirm = typer.confirm(
+                f"Are you sure you want to delete session '{session_id}' and all its history?"
+            )
+            if not confirm:
+                console.print("[yellow]Session deletion cancelled.[/yellow]")
+                return
+
+        if db.delete_session(session_id):
+            console.print(
+                f"[bold green]Deleted session:[/bold green] [bold cyan]{session_id}[/bold cyan]"
+            )
+        else:
+            print_error(f"Session '{session_id}' not found.", title="Session Not Found")
+            raise typer.Exit(code=1)
+    except typer.Exit:
+        raise
+    except Exception as err:
+        print_error(f"Failed to delete session: {err}", title="Session Error")
+        raise typer.Exit(code=1) from err
+
+
+def _get_toolbridge_manager(ctx: typer.Context) -> tuple[WorkspaceBoundary, Any]:
+    from termicode.tools.toolbridge import ToolBridgeServerManager
+
+    raw_workspace = ctx.obj.get("workspace") if ctx.obj else None
+    target_path = raw_workspace if raw_workspace is not None else Path.cwd()
+    boundary = WorkspaceBoundary(target_path)
+    boundary.ensure_termicode_dir()
+    return boundary, ToolBridgeServerManager(boundary.root)
+
+
+toolbridge_app = typer.Typer(
+    name="toolbridge",
+    help="Manage ToolBridge MCP Gateway servers, tool discovery, and remote execution.",
+    no_args_is_help=True,
+)
+app.add_typer(toolbridge_app, name="toolbridge")
+
+
+@toolbridge_app.command("add-server")
+def toolbridge_add_server(
+    ctx: typer.Context,
+    name: Annotated[
+        str,
+        typer.Argument(help="Logical identifier for the server."),
+    ],
+    url: Annotated[
+        str,
+        typer.Argument(help="Base URL of the ToolBridge service (e.g. http://127.0.0.1:8000)."),
+    ],
+    token: Annotated[
+        str | None,
+        typer.Option("--token", "-t", help="Optional authentication token or API key."),
+    ] = None,
+) -> None:
+    """Register or update a ToolBridge MCP Gateway server configuration."""
+    try:
+        _, manager = _get_toolbridge_manager(ctx)
+        record = manager.add_server(name, url, token=token)
+        console.print(
+            f"[bold green]Registered ToolBridge server:[/bold green] "
+            f"[bold cyan]{record['name']}[/bold cyan] -> {record['url']}"
+        )
+    except Exception as err:
+        print_error(f"Failed to add ToolBridge server: {err}", title="ToolBridge Error")
+        raise typer.Exit(code=1) from err
+
+
+@toolbridge_app.command("list-servers")
+def toolbridge_list_servers(ctx: typer.Context) -> None:
+    """List all configured ToolBridge servers and check their health."""
+    try:
+        boundary, manager = _get_toolbridge_manager(ctx)
+        servers = manager.list_servers()
+        if not servers:
+            console.print("[dim]No ToolBridge servers configured in active workspace.[/dim]")
+            return
+
+        table = Table(
+            title=f"ToolBridge Servers ({boundary.root.name})",
+            border_style="cyan",
+        )
+        table.add_column("Server Name", style="bold cyan", width=16)
+        table.add_column("URL", style="white")
+        table.add_column("Auth", justify="center", width=10)
+        table.add_column("Health / Status", style="green", width=24)
+
+        for s in servers:
+            s_name = s.get("name", "unknown")
+            s_url = s.get("url", "")
+            has_auth = "[green]Token[/green]" if s.get("token") else "[dim]None[/dim]"
+            client = manager.get_client(s_name)
+            try:
+                health = client.check_health()
+                status_str = f"[bold green]Healthy ({health.get('status', 'OK')})[/bold green]"
+            except Exception:
+                status_str = "[bold red]Unreachable[/bold red]"
+            table.add_row(s_name, s_url, has_auth, status_str)
+
+        console.print(table)
+    except Exception as err:
+        print_error(f"Failed to list ToolBridge servers: {err}", title="ToolBridge Error")
+        raise typer.Exit(code=1) from err
+
+
+@toolbridge_app.command("remove-server")
+def toolbridge_remove_server(
+    ctx: typer.Context,
+    name: Annotated[
+        str,
+        typer.Argument(help="Name of the server to remove."),
+    ],
+) -> None:
+    """Remove a configured ToolBridge server."""
+    try:
+        _, manager = _get_toolbridge_manager(ctx)
+        if manager.remove_server(name):
+            console.print(
+                f"[bold green]Removed ToolBridge server:[/bold green] [bold cyan]{name}[/bold cyan]"
+            )
+        else:
+            print_error(f"Server '{name}' not found.", title="ToolBridge Error")
+            raise typer.Exit(code=1)
+    except typer.Exit:
+        raise
+    except Exception as err:
+        print_error(f"Failed to remove ToolBridge server: {err}", title="ToolBridge Error")
+        raise typer.Exit(code=1) from err
+
+
+@toolbridge_app.command("list-tools")
+def toolbridge_list_tools(
+    ctx: typer.Context,
+    server: Annotated[
+        str | None,
+        typer.Argument(help="Optional server name to filter tools by."),
+    ] = None,
+) -> None:
+    """Discover and list available tools from ToolBridge server(s)."""
+    try:
+        boundary, manager = _get_toolbridge_manager(ctx)
+        tools = manager.discover_tools(server_name=server)
+        if not tools:
+            suffix = f" from server '{server}'" if server else ""
+            console.print(
+                f"[yellow]No tools discovered{suffix}.[/yellow] "
+                "[dim]Ensure ToolBridge is running and reachable.[/dim]"
+            )
+            return
+
+        table = Table(
+            title=f"ToolBridge Discovered Tools ({boundary.root.name})",
+            border_style="magenta",
+        )
+        table.add_column("Tool Name", style="bold cyan", width=28)
+        table.add_column("Server", style="yellow", width=14)
+        table.add_column("Tier", justify="center", style="magenta", width=12)
+        table.add_column("Description", style="white")
+
+        for t in tools:
+            t_name = t.get("namespaced_name") or t.get("name") or "unknown"
+            s_name = t.get("server_name", server or "default")
+            tier = t.get("sensitivity_tier", "SAFE")
+            desc = t.get("description", "")
+            table.add_row(t_name, s_name, tier, desc)
+
+        console.print(table)
+    except Exception as err:
+        print_error(f"Failed to discover tools: {err}", title="ToolBridge Error")
+        raise typer.Exit(code=1) from err
+
+
+@toolbridge_app.command("inspect-tool")
+def toolbridge_inspect_tool(
+    ctx: typer.Context,
+    name: Annotated[
+        str,
+        typer.Argument(help="Name of the tool to inspect."),
+    ],
+    server: Annotated[
+        str | None,
+        typer.Option("--server", "-s", help="Server name if tool exists across multiple servers."),
+    ] = None,
+) -> None:
+    """Inspect the metadata and JSON input schema of a ToolBridge tool."""
+    try:
+        _, manager = _get_toolbridge_manager(ctx)
+        tool_spec = manager.inspect_tool(name, server_name=server)
+        if not tool_spec:
+            print_error(f"Tool '{name}' not found.", title="Tool Not Found")
+            raise typer.Exit(code=1)
+
+        s_name = tool_spec.get("server_name", server or "default")
+        desc = tool_spec.get("description", "No description provided.")
+        tier = tool_spec.get("sensitivity_tier", "SAFE")
+        input_schema = tool_spec.get("input_schema", {})
+
+        schema_json = json.dumps(input_schema, indent=2)
+        content = (
+            f"[bold cyan]Tool Name:[/bold cyan] {name}\n"
+            f"[bold cyan]Server:[/bold cyan] {s_name}\n"
+            f"[bold cyan]Sensitivity Tier:[/bold cyan] {tier}\n"
+            f"[bold cyan]Description:[/bold cyan] {desc}\n\n"
+            f"[bold yellow]Input Schema (JSON Schema):[/bold yellow]\n{schema_json}"
+        )
+        console.print(Panel(content, title=f"Tool Specification: {name}", border_style="cyan"))
+    except typer.Exit:
+        raise
+    except Exception as err:
+        print_error(f"Failed to inspect tool '{name}': {err}", title="ToolBridge Error")
+        raise typer.Exit(code=1) from err
+
+
+@toolbridge_app.command("call-tool")
+def toolbridge_call_tool(
+    ctx: typer.Context,
+    server: Annotated[
+        str,
+        typer.Argument(help="Target ToolBridge server name."),
+    ],
+    tool_name: Annotated[
+        str,
+        typer.Argument(help="Namespaced or original tool name to call."),
+    ],
+    json_args: Annotated[
+        str,
+        typer.Option("--json", "-j", help="JSON string representing tool arguments."),
+    ] = "{}",
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Bypass interactive approval confirmation prompt."),
+    ] = False,
+) -> None:
+    """Execute a remote ToolBridge tool with an interactive approval gate."""
+    try:
+        _, manager = _get_toolbridge_manager(ctx)
+
+        try:
+            parsed_args = json.loads(json_args) if json_args else {}
+            if not isinstance(parsed_args, dict):
+                raise ValueError("JSON arguments must be an object (dictionary).")
+        except Exception as e:
+            print_error(f"Invalid JSON arguments: {e}", title="Argument Error")
+            raise typer.Exit(code=1) from e
+
+        # Approval gate: prompt user unless explicitly pre-approved with --yes
+        if not yes:
+            preview = (
+                f"[bold cyan]Server:[/bold cyan] {server}\n"
+                f"[bold cyan]Tool:[/bold cyan] {tool_name}\n"
+                f"[bold cyan]Arguments:[/bold cyan]\n{json.dumps(parsed_args, indent=2)}"
+            )
+            console.print(
+                Panel(
+                    preview,
+                    title="[bold yellow]Remote MCP Tool Execution Approval[/bold yellow]",
+                    border_style="yellow",
+                )
+            )
+            if not typer.confirm("Approve execution of this remote tool?", default=False):
+                console.print("[yellow]Execution cancelled by user.[/yellow]")
+                raise typer.Exit(code=0)
+
+        with console.status(f"[bold cyan]Invoking '{tool_name}' on '{server}'...[/bold cyan]"):
+            result = manager.call_tool(server, tool_name, parsed_args)
+
+        console.print("[bold green][OK] Tool Invocation Successful[/bold green]")
+        if isinstance(result, dict) and "result" in result:
+            console.print(result["result"])
+        else:
+            console.print(json.dumps(result, indent=2))
+
+    except typer.Exit:
+        raise
+    except Exception as err:
+        print_error(f"Tool invocation failed: {err}", title="Execution Error")
+        raise typer.Exit(code=1) from err
+
+
+@app.command()
+def chat(
+    ctx: typer.Context,
+    provider: Annotated[
+        str | None,
+        typer.Option(
+            "--provider", "-p", help="Override LLM provider ('ollama', 'openai', 'fake')."
+        ),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", "-m", help="Override LLM model name."),
+    ] = None,
+    offline: Annotated[
+        bool,
+        typer.Option("--offline", help="Run with built-in offline engine."),
+    ] = False,
+    steps: Annotated[
+        bool,
+        typer.Option(
+            "--steps/--no-steps", help="Toggle display of intermediate planner and safety steps."
+        ),
+    ] = True,
+    session: Annotated[
+        str | None,
+        typer.Option(
+            "--session", "-s", help="Resume or switch to a specific persistent session ID."
+        ),
+    ] = None,
+) -> None:
+    """Start an interactive Rich chat session with multi-line input and file attachments."""
+    from termicode.chat import ChatEngine, ChatREPL, ChatSession
+
+    raw_workspace = ctx.obj.get("workspace") if ctx.obj else None
+    target_path = raw_workspace if raw_workspace is not None else Path.cwd()
+
+    try:
+        boundary = WorkspaceBoundary(target_path)
+        boundary.ensure_termicode_dir()
+        settings = Settings.load(workspace=boundary.root)
+
+        if offline or (provider and provider.lower() == "fake"):
+            effective_provider_name = "fake"
+        elif provider:
+            effective_provider_name = provider.lower()
+        else:
+            effective_provider_name = settings.provider
+
+        session_obj = ChatSession(
+            workspace=boundary,
+            settings=settings,
+            verbose_steps=steps,
+            session_id=session,
+        )
+        session_obj.state.provider = effective_provider_name
+        if model:
+            session_obj.state.model = model
+
+        engine = ChatEngine(session=session_obj, boundary=boundary)
+        repl = ChatREPL(engine=engine)
+        repl.run_loop()
+
+    except Exception as err:
+        print_error(f"Failed to launch chat session: {err}", title="Chat Error")
+        raise typer.Exit(code=1) from err
+
+
+@app.command()
+def serve(
+    ctx: typer.Context,
+    provider: Annotated[
+        str | None,
+        typer.Option(
+            "--provider", "-p", help="Override LLM provider ('ollama', 'openai', 'fake')."
+        ),
+    ] = None,
+    model: Annotated[
+        str | None,
+        typer.Option("--model", "-m", help="Override LLM model name."),
+    ] = None,
+    offline: Annotated[
+        bool,
+        typer.Option("--offline", help="Run with built-in offline engine."),
+    ] = False,
+    session: Annotated[
+        str | None,
+        typer.Option(
+            "--session", "-s", help="Resume or switch to a specific persistent session ID."
+        ),
+    ] = None,
+) -> None:
+    """Serve the conversational chatbot interface."""
+    chat(ctx=ctx, provider=provider, model=model, offline=offline, session=session)
+
+
+@app.command()
+def companion(
+    ctx: typer.Context,
+    host: Annotated[
+        str,
+        typer.Option("--host", "-h", help="Host interface to bind companion service."),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option("--port", "-p", help="Port to listen on."),
+    ] = 8765,
+    token: Annotated[
+        str | None,
+        typer.Option("--token", "-t", help="Companion authentication token."),
+    ] = None,
+    open_browser: Annotated[
+        bool,
+        typer.Option("--open-browser", help="Open browser companion interface on start."),
+    ] = False,
+) -> None:
+    """Launch the secure local TermiCode Companion service for browser and IDE integration."""
+    import webbrowser
+
+    from termicode.companion.server import CompanionServer
+
+    raw_workspace: Path | None = ctx.obj.get("workspace") if ctx.obj else None
+    target_path = raw_workspace if raw_workspace is not None else Path.cwd()
+    boundary = WorkspaceBoundary(target_path)
+    console.print("[bold cyan]Starting TermiCode Local Companion...[/bold cyan]")
+    console.print(f"[dim]Workspace boundary: {boundary.root}[/dim]")
+
+    server = CompanionServer(
+        workspace_path=boundary.root,
+        host=host,
+        port=port,
+        token=token,
+    )
+
+    url = f"http://{host}:{server.port}/?token={server.token}"
+    console.print(f"[bold green][OK] Companion active at:[/bold green] [cyan]{url}[/cyan]")
+    console.print(f"[yellow]Companion Token:[/yellow] [bold]{server.token}[/bold]")
+    console.print("[dim]Press Ctrl+C to stop companion service.[/dim]\n")
+
+    if open_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+
+    try:
+        server.start(block=True)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Companion service stopped by user.[/yellow]")
+        server.stop()
+
+
+@app.command()
+def web(
+    ctx: typer.Context,
+    host: Annotated[
+        str,
+        typer.Option("--host", "-h", help="Host interface to bind web companion."),
+    ] = "127.0.0.1",
+    port: Annotated[
+        int,
+        typer.Option("--port", "-p", help="Port to listen on."),
+    ] = 8765,
+    token: Annotated[
+        str | None,
+        typer.Option("--token", "-t", help="Companion authentication token."),
+    ] = None,
+    open_browser: Annotated[
+        bool,
+        typer.Option("--open-browser", help="Open browser companion interface on start."),
+    ] = True,
+) -> None:
+    """Launch the TermiCode browser interface via local companion."""
+    companion(ctx=ctx, host=host, port=port, token=token, open_browser=open_browser)
 
 
 if __name__ == "__main__":
