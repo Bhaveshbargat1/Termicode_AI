@@ -11,6 +11,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import os
 import re
 import secrets
 import threading
@@ -76,10 +77,14 @@ class CompanionServer:
         allowed_origins: list[str] | None = None,
         settings: Settings | None = None,
         provider: LLMProvider | None = None,
+        hosted_mode: bool | None = None,
     ) -> None:
         self.workspace_path = Path(workspace_path).resolve()
         self.workspace_boundary = WorkspaceBoundary(self.workspace_path)
         self.workspace_boundary.ensure_termicode_dir()
+
+        hosted_env = bool(os.environ.get("RENDER") or os.environ.get("TERMICODE_HOSTED_MODE"))
+        self.is_hosted_mode = hosted_env if hosted_mode is None else hosted_mode
 
         self.host = host
         self.port = port
@@ -170,7 +175,12 @@ class CompanionServer:
         return False
 
     def validate_token(self, token_candidate: str | None) -> bool:
-        """Verify companion token using constant-time comparison."""
+        """Verify companion token using constant-time comparison.
+        
+        In hosted cloud demo mode, open read-only access is permitted.
+        """
+        if self.is_hosted_mode:
+            return True
         if not token_candidate:
             return False
         return hmac.compare_digest(token_candidate.strip(), self.token)
@@ -257,7 +267,7 @@ class CompanionServer:
                 # Local Companion Web UI frontend
                 if path in ("/", "/index.html"):
                     token = self._extract_token()
-                    if not server_instance.validate_token(token):
+                    if not server_instance.validate_token(token) and not server_instance.is_hosted_mode:
                         html = server_instance.get_login_ui_html()
                     else:
                         html = server_instance.get_embedded_ui_html()
@@ -449,10 +459,12 @@ class CompanionServer:
                         return
 
                     # Process chat query
-                    step_logs = server_instance.chat_engine.generate_step_logs(query)
-                    server_instance.chat_session.add_user_message(query)
-                    response_text = server_instance.chat_engine.get_response(query)
-                    server_instance.chat_session.add_assistant_message(response_text, step_logs=step_logs)
+                    try:
+                        response_text, step_logs = server_instance.chat_engine.generate_response(query)
+                    except Exception as e:
+                        logger.exception("Error processing chat message in companion")
+                        response_text = f"Notice: Error generating response: {e}"
+                        step_logs = []
 
                     self._send_json(200, {
                         "response": redact_secrets(response_text),
@@ -503,6 +515,13 @@ class CompanionServer:
 
                     if not task:
                         self._send_error_json(400, "Field 'task' cannot be empty.")
+                        return
+
+                    if server_instance.is_hosted_mode and wf_name in ("generate", "refactor", "tests", "debug"):
+                        self._send_error_json(
+                            403,
+                            "Hosted Sandbox Policy: Arbitrary shell execution and workspace mutations are disabled on this public demo instance. To execute workflows against your local code repositories, install TermiCode locally and launch 'termicode web'."
+                        )
                         return
 
                     try:
@@ -568,6 +587,13 @@ class CompanionServer:
                     return
 
                 if path == "/api/approve":
+                    if server_instance.is_hosted_mode:
+                        self._send_error_json(
+                            403,
+                            "Hosted Sandbox Policy: Modifying files or running commands via approval is disabled on this public demo instance."
+                        )
+                        return
+
                     approval_id = payload.get("approval_id", "")
                     approved = bool(payload.get("approved", False))
 
@@ -615,7 +641,13 @@ class CompanionServer:
                         })
                     return
 
-                if path == "/api/checkpoint":
+                if path in ("/api/checkpoint", "/api/git/checkpoint"):
+                    if server_instance.is_hosted_mode:
+                        self._send_error_json(
+                            403,
+                            "Hosted Sandbox Policy: Git checkpoints are disabled on the public demo instance."
+                        )
+                        return
                     msg = payload.get("message", "Manual snapshot via Companion UI")
                     try:
                         cp = server_instance.checkpoint_manager.create_checkpoint(
@@ -631,7 +663,13 @@ class CompanionServer:
                         self._send_error_json(400, f"Failed to create checkpoint: {e}")
                     return
 
-                if path == "/api/rollback":
+                if path in ("/api/rollback", "/api/git/rollback"):
+                    if server_instance.is_hosted_mode:
+                        self._send_error_json(
+                            403,
+                            "Hosted Sandbox Policy: Workspace rollbacks are disabled on the public demo instance."
+                        )
+                        return
                     cp_id = payload.get("checkpoint_id")
                     try:
                         cp = server_instance.checkpoint_manager.rollback(checkpoint_id=cp_id)
@@ -753,8 +791,28 @@ class CompanionServer:
     def get_embedded_ui_html(self) -> str:
         """Return the standalone modern HTML frontend for the local companion."""
         html = _EMBEDDED_COMPANION_HTML
+        hosted_banner = ""
+        badge_text = "Deterministic Boundary Active"
+        ws_display = str(self.workspace_boundary.root).replace("\\", "/")
+        if self.is_hosted_mode:
+            hosted_banner = """
+  <div class="bg-indigo-950/70 border-b border-indigo-800/60 px-4 py-2.5 text-xs text-indigo-200 flex flex-wrap items-center justify-between gap-2">
+    <div class="flex items-center space-x-2">
+      <span class="px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-semibold text-[10px] uppercase tracking-wider">Cloud Demo Active</span>
+      <span>Sandboxed read-only demonstration. File system mutations and shell commands are disabled on this instance. Run locally via <code>termicode web</code> for full workspace execution.</span>
+    </div>
+    <a href="https://github.com/Bhaveshbargat1/Termicode_AI" target="_blank" class="text-sky-400 hover:text-sky-300 hover:underline flex items-center space-x-1 font-medium">
+      <span>GitHub Repository</span> <i class="fa-solid fa-arrow-up-right-from-square text-[10px]"></i>
+    </a>
+  </div>
+"""
+            badge_text = "Cloud Demo (Sandboxed)"
+            ws_display = "TermiCode AI Cloud Workspace"
+
         return (
-            html.replace("__WORKSPACE_ROOT__", str(self.workspace_boundary.root).replace("\\", "/"))
+            html.replace("__WORKSPACE_ROOT__", ws_display)
+            .replace("__HOSTED_BANNER__", hosted_banner)
+            .replace("__BOUNDARY_BADGE__", badge_text)
             .replace("__COMPANION_TOKEN__", self.token)
             .replace("__SESSION_ID__", self.chat_session.state.session_id)
             .replace("__PROVIDER__", self.settings.provider)
@@ -787,6 +845,7 @@ _EMBEDDED_COMPANION_HTML = """<!DOCTYPE html>
   </style>
 </head>
 <body class="h-full flex flex-col bg-slate-950 text-slate-100 antialiased selection:bg-sky-500 selection:text-white">
+  __HOSTED_BANNER__
   <!-- Top Navigation Header -->
   <header class="border-b border-slate-800 bg-slate-900/90 backdrop-blur sticky top-0 z-40">
     <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
@@ -803,7 +862,7 @@ _EMBEDDED_COMPANION_HTML = """<!DOCTYPE html>
               ● Online
             </span>
             <span class="hidden sm:inline text-[10px] px-2 py-0.5 rounded-full bg-sky-500/10 text-sky-400 border border-sky-500/20">
-              Deterministic Boundary Active
+              __BOUNDARY_BADGE__
             </span>
           </div>
           <p class="text-xs text-slate-400 font-mono truncate max-w-sm sm:max-w-md" title="__WORKSPACE_ROOT__">
@@ -1320,7 +1379,12 @@ _EMBEDDED_COMPANION_HTML = """<!DOCTYPE html>
           const data = await res.json();
           appendMessage("assistant", data.response, data.step_logs);
         } else {
-          appendMessage("assistant", "Server Error: " + res.status);
+          let errDetail = "Server Error: " + res.status;
+          try {
+            const errData = await res.json();
+            if (errData && errData.error) errDetail = errData.error;
+          } catch(e) {}
+          appendMessage("assistant", errDetail);
         }
       } catch (err) {
         document.getElementById("typingIndicator").classList.add("hidden");
@@ -1349,6 +1413,13 @@ _EMBEDDED_COMPANION_HTML = """<!DOCTYPE html>
             loadFiles();
             loadGitStatus();
           }
+        } else {
+          let errDetail = "Task error (" + res.status + ")";
+          try {
+            const errData = await res.json();
+            if (errData && errData.error) errDetail = errData.error;
+          } catch(e) {}
+          appendMessage("assistant", errDetail);
         }
       } catch (err) {
         document.getElementById("typingIndicator").classList.add("hidden");

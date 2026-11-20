@@ -29,4 +29,9 @@ RUN useradd -m -s /bin/bash termicode && \
     chown -R termicode:termicode /workspace
 USER termicode
 
-CMD ["termicode", "chat"]
+EXPOSE 8765
+
+HEALTHCHECK --interval=20s --timeout=5s --start-period=5s --retries=3 \
+    CMD sh -c 'curl -f http://127.0.0.1:${PORT:-8765}/health || exit 1'
+
+CMD ["termicode", "web", "--host", "0.0.0.0"]

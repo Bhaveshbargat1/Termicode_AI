@@ -177,6 +177,11 @@ class ChatEngine:
         self.session.add_assistant_message(response_text, step_logs=step_logs)
         return response_text, step_logs
 
+    def get_response(self, query: str) -> str:
+        """Convenience method returning the text response for a query."""
+        resp, _ = self.generate_response(query)
+        return resp
+
     def stream_chunks(self, full_text: str, chunk_delay: float = 0.008) -> Iterator[str]:
         """Yield word chunks from full_text to simulate a smooth streaming terminal effect."""
         words = full_text.split(" ")

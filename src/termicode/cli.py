@@ -2431,6 +2431,16 @@ def companion(
 
     from termicode.companion.server import CompanionServer
 
+    # Dynamic host & port discovery (supports Render and cloud container deployments)
+    env_port = os.environ.get("PORT")
+    effective_port = int(env_port) if env_port and port == 8765 else port
+
+    env_host = os.environ.get("HOST")
+    if host == "127.0.0.1" and (os.environ.get("PORT") or os.environ.get("RENDER")):
+        effective_host = env_host or "0.0.0.0"
+    else:
+        effective_host = env_host if env_host and host == "127.0.0.1" else host
+
     raw_workspace: Path | None = ctx.obj.get("workspace") if ctx.obj else None
     target_path = raw_workspace if raw_workspace is not None else Path.cwd()
     boundary = WorkspaceBoundary(target_path)
@@ -2439,17 +2449,20 @@ def companion(
 
     server = CompanionServer(
         workspace_path=boundary.root,
-        host=host,
-        port=port,
+        host=effective_host,
+        port=effective_port,
         token=token,
     )
 
-    url = f"http://{host}:{server.port}/?token={server.token}"
+    url = f"http://{effective_host}:{server.port}/?token={server.token}"
     console.print(f"[bold green][OK] Companion active at:[/bold green] [cyan]{url}[/cyan]")
-    console.print(f"[yellow]Companion Token:[/yellow] [bold]{server.token}[/bold]")
+    if not server.is_hosted_mode:
+        console.print(f"[yellow]Companion Token:[/yellow] [bold]{server.token}[/bold]")
+    else:
+        console.print("[bold green][INFO] Running in Public Hosted Demo Mode (Sandboxed, Read-Only).[/bold green]")
     console.print("[dim]Press Ctrl+C to stop companion service.[/dim]\n")
 
-    if open_browser:
+    if open_browser and not server.is_hosted_mode and not os.environ.get("RENDER"):
         try:
             webbrowser.open(url)
         except Exception:
